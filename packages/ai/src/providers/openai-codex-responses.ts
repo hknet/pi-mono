@@ -301,6 +301,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
+			// TODO(diagnostics): consider emitting diagnostics for unrecovered HTTP/SSE provider failures.
 			for (const block of output.content) {
 				// partialJson is only a streaming scratch buffer; never persist it.
 				delete (block as { partialJson?: string }).partialJson;
@@ -495,10 +496,20 @@ async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): 
 		if (!type) continue;
 
 		if (type === "error") {
-			const code = (event as { code?: string }).code || "";
-			const message = (event as { message?: string }).message || "";
-			throw new CodexApiError(`Codex error: ${message || code || JSON.stringify(event)}`, {
-				code: code || undefined,
+			const errEvent = event as {
+				error?: CodexErrorBody;
+				status_code?: unknown;
+				message?: string;
+				code?: string;
+			};
+			const statusCode = typeof errEvent.status_code === "number" ? errEvent.status_code : undefined;
+			const built = extractCodexErrorInfo(errEvent.error, statusCode);
+			if (built.friendlyMessage) {
+				throw new CodexApiError(built.friendlyMessage, { code: built.code, payload: event });
+			}
+			const fallback = built.message || errEvent.message || errEvent.code || JSON.stringify(event);
+			throw new CodexApiError(`Codex error: ${fallback}`, {
+				code: built.code || errEvent.code || undefined,
 				payload: event,
 			});
 		}
@@ -1215,31 +1226,39 @@ async function processWebSocketStream(
 // Error Handling
 // ============================================================================
 
+type CodexErrorBody = {
+	code?: string;
+	type?: string;
+	message?: string;
+	plan_type?: string;
+	resets_at?: number;
+};
+
+function extractCodexErrorInfo(
+	err: CodexErrorBody | undefined,
+	statusCode: number | undefined,
+): { message: string; friendlyMessage?: string; code?: string } {
+	if (!err) return { message: "" };
+	const code = err.code || err.type || "";
+	let friendlyMessage: string | undefined;
+	if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || statusCode === 429) {
+		const plan = err.plan_type ? ` (${err.plan_type.toLowerCase()} plan)` : "";
+		const mins = err.resets_at ? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000)) : undefined;
+		const when = mins !== undefined ? ` Try again in ~${mins} min.` : "";
+		friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
+	}
+	return { message: friendlyMessage || err.message || "", friendlyMessage, code: code || undefined };
+}
+
 async function parseErrorResponse(response: Response): Promise<{ message: string; friendlyMessage?: string }> {
 	const raw = await response.text();
-	let message = raw || response.statusText || "Request failed";
-	let friendlyMessage: string | undefined;
-
+	const fallback = raw || response.statusText || "Request failed";
 	try {
-		const parsed = JSON.parse(raw) as {
-			error?: { code?: string; type?: string; message?: string; plan_type?: string; resets_at?: number };
-		};
-		const err = parsed?.error;
-		if (err) {
-			const code = err.code || err.type || "";
-			if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429) {
-				const plan = err.plan_type ? ` (${err.plan_type.toLowerCase()} plan)` : "";
-				const mins = err.resets_at
-					? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000))
-					: undefined;
-				const when = mins !== undefined ? ` Try again in ~${mins} min.` : "";
-				friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
-			}
-			message = err.message || friendlyMessage || message;
-		}
+		const parsed = JSON.parse(raw) as { error?: CodexErrorBody };
+		const built = extractCodexErrorInfo(parsed?.error, response.status);
+		return { message: built.message || fallback, friendlyMessage: built.friendlyMessage };
 	} catch {}
-
-	return { message, friendlyMessage };
+	return { message: fallback };
 }
 
 // ============================================================================

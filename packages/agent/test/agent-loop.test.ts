@@ -1155,6 +1155,146 @@ describe("agentLoop with AgentMessage", () => {
 
 		expect(llmCalls).toBe(1);
 	});
+
+	it("should retry once when a turn fails with a transient transport diagnostic", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const userPrompt = createUserMessage("Hi");
+		const llmMessageBatches: number[] = [];
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: (messages) => {
+				const llm = messages.filter(
+					(m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult",
+				) as Message[];
+				llmMessageBatches.push(llm.length);
+				return llm;
+			},
+		};
+
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (callIndex === 0) {
+					const failed: AssistantMessage = {
+						...createAssistantMessage([], "error"),
+						errorMessage: "WebSocket closed 1006",
+						diagnostics: [
+							{
+								type: "provider_transport_failure",
+								timestamp: Date.now(),
+								error: { name: "WebSocketCloseError", message: "WebSocket closed 1006", code: 1006 },
+							},
+						],
+					};
+					stream.push({ type: "error", reason: "error", error: failed });
+				} else {
+					const ok = createAssistantMessage([{ type: "text", text: "recovered" }]);
+					stream.push({ type: "done", reason: "stop", message: ok });
+				}
+				callIndex++;
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		expect(callIndex).toBe(2);
+		expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "assistant"]);
+		expect((messages[1] as AssistantMessage).stopReason).toBe("error");
+		expect((messages[2] as AssistantMessage).stopReason).toBe("stop");
+		// The retry must not replay the failed turn back to the LLM.
+		expect(llmMessageBatches).toEqual([1, 1]);
+		expect(events.filter((e) => e.type === "turn_start").length).toBe(2);
+		expect(events.filter((e) => e.type === "turn_end").length).toBe(2);
+	});
+
+	it("should not retry when the diagnostic is unrelated to transport", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const userPrompt = createUserMessage("Hi");
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const failed: AssistantMessage = {
+					...createAssistantMessage([], "error"),
+					errorMessage: "boom",
+				};
+				stream.push({ type: "error", reason: "error", error: failed });
+				callIndex++;
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// consume
+		}
+
+		expect(callIndex).toBe(1);
+	});
+
+	it("should give up after one transient transport retry", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const userPrompt = createUserMessage("Hi");
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const failed: AssistantMessage = {
+					...createAssistantMessage([], "error"),
+					errorMessage: "WebSocket closed 1006",
+					diagnostics: [
+						{
+							type: "provider_transport_failure",
+							timestamp: Date.now(),
+							error: { message: "WebSocket closed 1006", code: 1006 },
+						},
+					],
+				};
+				stream.push({ type: "error", reason: "error", error: failed });
+				callIndex++;
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// consume
+		}
+
+		expect(callIndex).toBe(2);
+	});
 });
 
 describe("agentLoopContinue with AgentMessage", () => {

@@ -25,6 +25,18 @@ import type {
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 /**
+ * Max number of automatic retries when a turn fails with a transient provider transport error
+ * (e.g. an OpenAI Codex WebSocket dropped mid-stream by undici's 4MB message ceiling). The
+ * provider records the failure so the next attempt falls back to a different transport (SSE).
+ */
+const MAX_TRANSIENT_TRANSPORT_RETRIES = 1;
+
+function isTransientTransportFailure(message: AssistantMessage): boolean {
+	if (message.stopReason !== "error") return false;
+	return message.diagnostics?.some((d) => d.type === "provider_transport_failure") === true;
+}
+
+/**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
  */
@@ -187,8 +199,25 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			// Stream assistant response, retrying once on transient transport failures
+			// (the provider has already marked the session for fallback transport, so the
+			// retry will use SSE instead of the WebSocket that just died).
+			let message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			let transientRetries = 0;
+			while (
+				!signal?.aborted &&
+				transientRetries < MAX_TRANSIENT_TRANSPORT_RETRIES &&
+				isTransientTransportFailure(message)
+			) {
+				transientRetries++;
+				newMessages.push(message);
+				if (currentContext.messages[currentContext.messages.length - 1] === message) {
+					currentContext.messages.pop();
+				}
+				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "turn_start" });
+				message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			}
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
