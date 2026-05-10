@@ -9,7 +9,7 @@ import type {
 	TextContent,
 	Tool,
 	ToolResultMessage,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
 
 /**
@@ -112,6 +112,18 @@ export interface ShouldStopAfterTurnContext {
 	newMessages: AgentMessage[];
 }
 
+/** Replacement runtime state used by the agent loop before starting another provider request. */
+export interface AgentLoopTurnUpdate {
+	/** Context for the next provider request. */
+	context?: AgentContext;
+	/** Model for the next provider request. */
+	model?: Model<any>;
+	/** Thinking level for the next provider request. */
+	thinkingLevel?: ThinkingLevel;
+}
+
+export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
+
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
@@ -188,6 +200,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
 
 	/**
+	 * Called after `turn_end` and before the loop decides whether another provider request should start.
+	 * Return replacement context/model/thinking state to affect the next turn in this run.
+	 * Return undefined to keep using the current context/config.
+	 */
+	prepareNextTurn?: (
+		context: PrepareNextTurnContext,
+	) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
+
+	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
 	 * Called after the current assistant turn finishes executing its tool calls, unless `shouldStopAfterTurn` exits first.
@@ -250,7 +271,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 /**
  * Thinking/reasoning level for models that support it.
  * Note: "xhigh" is only supported by selected model families. Use model thinking-level metadata
- * from @mariozechner/pi-ai to detect support for a concrete model.
+ * from @earendil-works/pi-ai to detect support for a concrete model.
  */
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
